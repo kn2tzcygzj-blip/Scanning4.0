@@ -7,11 +7,9 @@ import ssl
 import socket
 import datetime
 import threading
-import urllib.parse
+import webbrowser
 from urllib.parse import urljoin, urlparse, parse_qs
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-
 try:
     import requests
     from requests.adapters import HTTPAdapter
@@ -21,53 +19,15 @@ try:
 except ImportError as e:
     print(f"Missing: {e}. Run: pip install requests colorama")
     sys.exit(1)
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 init(autoreset=True)
-
-# ==================== IMPORT CUSTOM MODULES ====================
-try:
-    from utils import is_false_positive, time_based_test, check_known_cve
-    from advanced_scanners import *
-except ImportError as e:
-    print(f"[!] Missing advanced modules: {e}. Run: pip install requests colorama")
-    print("[!] Advanced scanners will be disabled.")
-    # Fallback: define dummy functions
-    def is_false_positive(a,b): return False
-    def time_based_test(a,b,c,d,e): return False
-    def check_known_cve(a): return []
-
-# ==================== LOAD CONFIG ====================
-CONFIG = {
-    "threads": 10,
-    "timeout": 8,
-    "max_depth": 3,
-    "delay": 0.5,
-    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "output_dir": "./reports",
-    "enable_advanced": True,
-    "enable_cve_check": True,
-    "verbose": False
-}
-
-try:
-    with open("config.json", "r") as f:
-        CONFIG.update(json.load(f))
-except:
-    pass
-
-# ==================== LOGGER ====================
-def log_info(msg, color='green'):
-    colors = {'green': Fore.GREEN, 'red': Fore.RED, 'yellow': Fore.YELLOW,
-              'cyan': Fore.CYAN, 'magenta': Fore.MAGENTA, 'blue': Fore.BLUE}
-    print(f"{colors.get(color, Fore.WHITE)}{msg}{Style.RESET_ALL}")
 
 # ==================== HTTP CLIENT ====================
 def get_session(proxy=None):
     session = requests.Session()
     if proxy:
         session.proxies = {'http': proxy, 'https': proxy}
-    session.headers.update({'User-Agent': CONFIG.get("user_agent")})
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
     retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('http://', adapter)
@@ -75,35 +35,31 @@ def get_session(proxy=None):
     session.verify = False
     return session
 
+# ==================== LOGGER ====================
+def log_info(msg, color='green'):
+    colors = {'green': Fore.GREEN, 'red': Fore.RED, 'yellow': Fore.YELLOW, 'cyan': Fore.CYAN, 'magenta': Fore.MAGENTA}
+    print(f"{colors.get(color, Fore.WHITE)}{msg}{Style.RESET_ALL}")
+
 # ==================== CRAWLER ====================
 class Crawler:
     def __init__(self, base_url, proxy=None):
         self.base_url = base_url.rstrip('/')
         self.session = get_session(proxy)
-        self.max_depth = CONFIG.get("max_depth", 2)
         self.visited = set()
         self.urls = set()
         self.forms = []
-        self.js_endpoints = set()
         self.params = set()
         self.lock = threading.Lock()
-
     def crawl(self):
         self._crawl_page(self.base_url, 0)
-        return {
-            'urls': list(self.urls),
-            'forms': self.forms,
-            'js_endpoints': list(self.js_endpoints),
-            'params': list(self.params)
-        }
-
+        return {'urls': list(self.urls), 'forms': self.forms, 'params': list(self.params)}
     def _crawl_page(self, url, depth):
-        if depth > self.max_depth or url in self.visited:
+        if depth > 2 or url in self.visited:
             return
         with self.lock:
             self.visited.add(url)
         try:
-            resp = self.session.get(url, timeout=CONFIG.get("timeout", 8), allow_redirects=True)
+            resp = self.session.get(url, timeout=8, allow_redirects=True)
             if resp.status_code != 200:
                 return
             html = resp.text
@@ -111,22 +67,17 @@ class Crawler:
                 abs_url = urljoin(url, link)
                 if self._same_domain(abs_url) and abs_url not in self.visited:
                     self.urls.add(abs_url)
-                    if depth < self.max_depth:
-                        self._crawl_page(abs_url, depth + 1)
+                    self._crawl_page(abs_url, depth+1)
             for action, content in re.findall(r'<form[^>]*action=["\']([^"\']*)["\'][^>]*>(.*?)</form>', html, re.I | re.S):
                 action_url = urljoin(url, action)
-                method = 'POST' if 'method="post"' in content.lower() else 'GET'
                 inputs = re.findall(r'<input[^>]*name=["\']([^"\']+)["\']', content, re.I)
-                self.forms.append({'action': action_url, 'method': method, 'params': inputs})
-            for js in re.findall(r'<script[^>]*src=["\']([^"\']+\.js)["\']', html, re.I):
-                self.js_endpoints.add(urljoin(url, js))
+                self.forms.append({'action': action_url, 'params': inputs})
             parsed = urlparse(url)
             if parsed.query:
                 for key in parse_qs(parsed.query):
                     self.params.add(key)
         except Exception:
             pass
-
     def _same_domain(self, url):
         try:
             return urlparse(url).netloc == urlparse(self.base_url).netloc or urlparse(url).netloc == ''
@@ -138,7 +89,6 @@ class Fingerprinter:
     def __init__(self, url, proxy=None):
         self.url = url
         self.session = get_session(proxy)
-
     def detect(self):
         tech = {}
         try:
@@ -166,109 +116,158 @@ class Fingerprinter:
             pass
         return tech
 
-# ==================== REPORT ====================
-def generate_report(findings, target, tech_stack, output_dir=None):
-    if not output_dir:
-        output_dir = CONFIG.get("output_dir", "./reports")
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_target = target.replace('https://', '').replace('http://', '').replace('/', '_')
-    base = f"{output_dir}/vulnscan_{safe_target}_{timestamp}"
+# ==================== SCANNER ====================
+class BaseScanner:
+    def __init__(self, target_url, proxy=None):
+        self.target_url = target_url.rstrip('/')
+        self.proxy = proxy
+        self.session = get_session(proxy)
+        self.context = {}
+    def set_context(self, **kwargs):
+        self.context.update(kwargs)
+    def _add_finding(self, severity, title, description, evidence=""):
+        return {'severity': severity.upper(), 'title': title, 'description': description, 'evidence': evidence[:1500] if evidence else "", 'timestamp': datetime.datetime.now().isoformat()}
+    def _safe_get(self, url, timeout=8):
+        try:
+            return self.session.get(url, timeout=timeout, allow_redirects=True)
+        except:
+            return None
 
-    with open(f"{base}.json", 'w') as f:
-        json.dump({'target': target, 'timestamp': timestamp, 'tech_stack': tech_stack, 'findings': findings}, f, indent=2, default=str)
+# ==================== SCANNERS ====================
+class SQLiScanner(BaseScanner):
+    def scan(self):
+        findings = []
+        params = self.context.get('params', ['id', 'q', 'page'])
+        for param in params[:5]:
+            for payload in ["' OR '1'='1", "' OR 1=1--", "' UNION SELECT NULL--"]:
+                test_url = f"{self.target_url}?{param}={payload}"
+                resp = self._safe_get(test_url)
+                if resp and resp.status_code == 200 and re.search(r'(SQL|syntax|mysql|postgres|oracle|sqlite)', resp.text, re.I):
+                    findings.append(self._add_finding('CRITICAL', 'SQL Injection', f'Parameter {param} vulnerable', resp.text[:300]))
+                    break
+        return findings
 
-    counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0}
-    for f in findings:
-        sev = f['severity'].upper()
+class XSSScanner(BaseScanner):
+    def scan(self):
+        findings = []
+        params = self.context.get('params', ['q', 'search'])
+        for param in params[:5]:
+            for payload in ["<script>alert(1)</script>", "<img src=x onerror=alert(1)>"]:
+                test_url = f"{self.target_url}?{param}={payload}"
+                resp = self._safe_get(test_url)
+                if resp and resp.status_code == 200 and payload in resp.text:
+                    findings.append(self._add_finding('HIGH', 'XSS Reflected', f'Parameter {param} vulnerable', resp.text[:300]))
+                    break
+        return findings
+
+class LFIScanner(BaseScanner):
+    def scan(self):
+        findings = []
+        params = self.context.get('params', ['page', 'file'])
+        for param in params[:5]:
+            for payload in ["/etc/passwd", "/etc/hosts"]:
+                test_url = f"{self.target_url}?{param}={payload}"
+                resp = self._safe_get(test_url)
+                if resp and resp.status_code == 200 and re.search(r'(root:|nobody:|/etc/passwd)', resp.text, re.I):
+                    findings.append(self._add_finding('HIGH', 'LFI', f'Parameter {param} vulnerable', resp.text[:300]))
+                    break
+        return findings
+
+class HeadersScanner(BaseScanner):
+    def scan(self):
+        findings = []
+        resp = self._safe_get(self.target_url)
+        if not resp:
+            return findings
+        missing = [h for h in ['X-Frame-Options', 'X-Content-Type-Options', 'Strict-Transport-Security', 'Content-Security-Policy'] if h not in resp.headers]
+        if missing:
+            findings.append(self._add_finding('MEDIUM', 'Missing Security Headers', f'Missing: {", ".join(missing)}', str(dict(resp.headers))))
+        return findings
+
+ALL_SCANNERS = [SQLiScanner, XSSScanner, LFIScanner, HeadersScanner]
+
+# ==================== LOCALHOST SERVER ====================
+from flask import Flask, render_template_string
+
+app = Flask(__name__)
+FINDINGS = []
+TARGET = ""
+
+@app.route('/')
+def index():
+    counts = {'CRITICAL':0, 'HIGH':0, 'MEDIUM':0, 'LOW':0}
+    for f in FINDINGS:
+        sev = f['severity']
         if sev in counts:
             counts[sev] += 1
-
-    findings_html = ""
-    for f in findings:
-        findings_html += f"""
-        <div class="finding">
-            <span class="badge {f['severity'].lower()}">{f['severity']}</span>
-            <span class="title">{f['title']}</span>
-            <div class="desc">{f['description']}</div>
-            {f'<div class="evidence">{f["evidence"]}</div>' if f.get('evidence') else ''}
-            <div class="timestamp">{f['timestamp']}</div>
-        </div>
-        """
-
-    tech_html = "".join([f"<li><strong>{k}:</strong> {v}</li>" for k, v in tech_stack.items()])
-
-    html = f"""
+    return render_template_string("""
     <!DOCTYPE html>
     <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>VulnScan Report</title>
-        <style>
-            body{{font-family:sans-serif;background:#f5f7fa;padding:20px;color:#2c3e50;}}
-            .container{{max-width:1100px;margin:0 auto;background:#fff;padding:30px;border-radius:12px;}}
-            h1{{color:#2c3e50;border-bottom:3px solid #3498db;padding-bottom:10px;}}
-            .meta{{display:flex;flex-wrap:wrap;gap:20px;background:#f8f9fa;padding:15px;border-radius:8px;margin:15px 0;}}
-            .badge{{display:inline-block;padding:4px 12px;border-radius:20px;font-weight:bold;font-size:0.8em;color:#fff;}}
-            .critical{{background:#c0392b;}}.high{{background:#e67e22;}}.medium{{background:#f39c12;}}.low{{background:#3498db;}}.info{{background:#95a5a6;}}
-            .finding{{border-left:5px solid #3498db;padding:15px 20px;margin:15px 0;background:#fafbfc;border-radius:4px;}}
-            .finding .title{{font-weight:600;font-size:1.05em;margin-left:8px;}}
-            .finding .evidence{{background:#ecf0f1;padding:10px;border-radius:4px;white-space:pre-wrap;font-family:monospace;font-size:0.85em;max-height:200px;overflow:auto;}}
-            .footer{{margin-top:30px;border-top:1px solid #ddd;padding-top:15px;color:#999;text-align:center;}}
-            .summary-grid{{display:flex;gap:15px;flex-wrap:wrap;margin:15px 0;}}
-            .summary-item{{background:#f8f9fa;padding:10px 20px;border-radius:8px;text-align:center;flex:1;min-width:80px;}}
-            .summary-item .number{{font-size:24px;font-weight:bold;}}
-            .summary-item.critical .number{{color:#c0392b;}}
-            .summary-item.high .number{{color:#e67e22;}}
-            .summary-item.medium .number{{color:#f39c12;}}
-            .summary-item.low .number{{color:#3498db;}}
-            .summary-item.info .number{{color:#95a5a6;}}
-        </style>
+    <head><title>VulnScan Report</title>
+    <style>
+        body{font-family:sans-serif;background:#f5f7fa;padding:20px;color:#2c3e50;}
+        .container{max-width:1100px;margin:0 auto;background:#fff;padding:30px;border-radius:12px;}
+        h1{color:#2c3e50;border-bottom:3px solid #3498db;padding-bottom:10px;}
+        .badge{display:inline-block;padding:4px 12px;border-radius:20px;font-weight:bold;font-size:0.8em;color:#fff;}
+        .critical{background:#c0392b;}.high{background:#e67e22;}.medium{background:#f39c12;}.low{background:#3498db;}
+        .finding{border-left:5px solid #3498db;padding:15px 20px;margin:15px 0;background:#fafbfc;border-radius:4px;}
+        .evidence{background:#ecf0f1;padding:10px;border-radius:4px;white-space:pre-wrap;font-family:monospace;font-size:0.85em;max-height:200px;overflow:auto;}
+        .summary-grid{display:flex;gap:15px;flex-wrap:wrap;margin:15px 0;}
+        .summary-item{background:#f8f9fa;padding:10px 20px;border-radius:8px;text-align:center;flex:1;min-width:80px;}
+        .summary-item .number{font-size:24px;font-weight:bold;}
+        .summary-item.critical .number{color:#c0392b;}
+        .summary-item.high .number{color:#e67e22;}
+        .summary-item.medium .number{color:#f39c12;}
+        .summary-item.low .number{color:#3498db;}
+        .download-btn{background:#3498db;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:1em;}
+        .footer{margin-top:30px;border-top:1px solid #ddd;padding-top:15px;color:#999;text-align:center;}
+    </style>
     </head>
     <body>
     <div class="container">
         <h1>VulnScan Security Audit Report</h1>
-        <div class="meta">
-            <span><strong>Target:</strong> {target}</span>
-            <span><strong>Date:</strong> {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</span>
-            <span><strong>Findings:</strong> {len(findings)}</span>
-        </div>
+        <p><strong>Target:</strong> {{ target }}</p>
         <div class="summary-grid">
-            <div class="summary-item critical"><div class="number">{counts['CRITICAL']}</div>Critical</div>
-            <div class="summary-item high"><div class="number">{counts['HIGH']}</div>High</div>
-            <div class="summary-item medium"><div class="number">{counts['MEDIUM']}</div>Medium</div>
-            <div class="summary-item low"><div class="number">{counts['LOW']}</div>Low</div>
-            <div class="summary-item info"><div class="number">{counts['INFO']}</div>Info</div>
+            <div class="summary-item critical"><div class="number">{{ counts.CRITICAL }}</div>Critical</div>
+            <div class="summary-item high"><div class="number">{{ counts.HIGH }}</div>High</div>
+            <div class="summary-item medium"><div class="number">{{ counts.MEDIUM }}</div>Medium</div>
+            <div class="summary-item low"><div class="number">{{ counts.LOW }}</div>Low</div>
         </div>
-        <h3>Tech Stack</h3>
-        <ul>{tech_html}</ul>
         <h3>Findings</h3>
-        {findings_html if findings_html else '<p>No vulnerabilities found.</p>'}
+        {% for f in findings %}
+        <div class="finding">
+            <span class="badge {{ f.severity.lower() }}">{{ f.severity }}</span>
+            <strong>{{ f.title }}</strong>
+            <p>{{ f.description }}</p>
+            {% if f.evidence %}
+            <div class="evidence">{{ f.evidence }}</div>
+            {% endif %}
+            <small>{{ f.timestamp }}</small>
+        </div>
+        {% else %}
+        <p>No vulnerabilities found.</p>
+        {% endfor %}
+        <button class="download-btn" onclick="downloadHTML()">Download Report (HTML)</button>
         <div class="footer">Generated by VulnScan</div>
     </div>
+    <script>
+        function downloadHTML(){
+            var html = document.documentElement.outerHTML;
+            var blob = new Blob([html], {type:'text/html'});
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'VulnScan_Report_{{ target }}.html';
+            a.click();
+        }
+    </script>
     </body>
     </html>
-    """
+    """, target=TARGET, findings=FINDINGS, counts=counts)
 
-    with open(f"{base}.html", 'w') as f:
-        f.write(html)
-
-    return f"{base}.html"
+def run_localhost(port=8080):
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 # ==================== ENGINE ====================
-from scanners import ALL_SCANNERS
-
-# Jika advanced scanners tersedia, tambahkan ke daftar
-try:
-    from advanced_scanners import *
-    ADVANCED_SCANNERS = [
-        NoSQLiScanner, SSRFScanner, JWTScanner, GraphQLScanner,
-        CVEScanner, RaceConditionScanner, FileUploadScanner, SensitiveHeaderScanner
-    ]
-    ALL_SCANNERS.extend(ADVANCED_SCANNERS)
-except:
-    pass
-
 class ScanEngine:
     def __init__(self, target_url, proxy=None):
         self.target_url = target_url.rstrip('/')
@@ -280,65 +279,42 @@ class ScanEngine:
         self.stop = False
 
     def run_interactive(self):
+        global FINDINGS, TARGET
         log_info("Fingerprinting target...", "cyan")
         fp = Fingerprinter(self.target_url, self.proxy)
         self.tech_stack = fp.detect()
         log_info(f"Tech Stack: {self.tech_stack}", "yellow")
 
-        # CVE Check
-        if CONFIG.get("enable_cve_check", True):
-            cves = check_known_cve(self.tech_stack)
-            for cve in cves:
-                log_info(f"[CVE] {cve}", "red")
-                self.findings.append({
-                    'severity': 'HIGH',
-                    'title': cve,
-                    'description': 'Known vulnerability detected based on tech stack',
-                    'evidence': '',
-                    'timestamp': datetime.datetime.now().isoformat()
-                })
-
         log_info("Crawling target...", "cyan")
         crawler = Crawler(self.target_url, self.proxy)
         crawled = crawler.crawl()
-
         urls = crawled['urls']
         forms = crawled['forms']
         params = crawled['params']
-        js_endpoints = crawled['js_endpoints']
-
         log_info(f"Found: {len(urls)} URLs, {len(forms)} forms, {len(params)} params", "green")
 
         for idx, scanner_class in enumerate(ALL_SCANNERS):
             if self.stop:
                 break
-
             self.current_method = idx + 1
             scanner = scanner_class(self.target_url, self.proxy)
-            scanner.set_context(
-                urls=urls,
-                forms=forms,
-                params=params,
-                js_endpoints=js_endpoints,
-                tech_stack=self.tech_stack
-            )
-
+            scanner.set_context(urls=urls, forms=forms, params=params)
             method_name = scanner.__class__.__name__.replace('Scanner', '')
             log_info(f"[{self.current_method}/{self.total_methods}] Scanning: {method_name}", "magenta")
 
+            # Progress tiap 5 detik
             progress_thread = threading.Thread(target=self._show_progress, args=(method_name,))
             progress_thread.daemon = True
             progress_thread.start()
 
             findings = scanner.scan()
-
             if findings:
                 for f in findings:
-                    log_info(f"  [!] {f['severity']}: {f['title']}", "red")
+                    log_info(f"  [!] {f['severity']}: {f['title']} - {f['description'][:50]}...", "red")
                     self.findings.append(f)
 
             if self.current_method < self.total_methods:
-                print("[?] Continue to next method? (y/n): ", end="")
+                print("\n[?] Continue to next method? (y/n): ", end="")
                 choice = input().strip().lower()
                 if choice != 'y':
                     log_info("Scan stopped by user.", "yellow")
@@ -346,6 +322,8 @@ class ScanEngine:
                     break
 
         log_info("Scan complete.", "green")
+        FINDINGS = self.findings
+        TARGET = self.target_url
         return self.findings
 
     def _show_progress(self, method_name):
@@ -368,7 +346,7 @@ __      __    _       _____
    \\  /| |_| | | | | |___) | (_| (_| | | | |
     \\/  \\__,_|_| |_|____/ \\___\\__,_|_| |_|
 \033[0m
-        \033[94m[ VulnScan v1.0 ]\033[0m
+        \033[94m[ VulnScan v4.0 ]\033[0m
    \033[94mWebsite Security Scanner & Auditor\033[0m
 """
 
@@ -387,16 +365,17 @@ def main():
     engine = ScanEngine(target, proxy)
     findings = engine.run_interactive()
 
-    report_path = generate_report(findings, target, engine.tech_stack)
-    print(f"[+] Report: {report_path}")
-    print(f"[+] Total findings: {len(findings)}")
-
     critical = sum(1 for f in findings if f['severity'] == 'CRITICAL')
     high = sum(1 for f in findings if f['severity'] == 'HIGH')
     if critical > 0 or high > 0:
-        print(f"[!] {target} has CRITICAL/HIGH vulnerabilities!")
+        log_info(f"[!] {target} memiliki CRITICAL/HIGH vulnerability!", "red")
     else:
-        print(f"[+] {target} no critical/high vulnerabilities.")
+        log_info(f"[+] {target} tidak memiliki celah CRITICAL/HIGH.", "green")
+
+    print("\n[+] Tekan Enter untuk membuka laporan di localhost (http://localhost:8080)")
+    input()
+    print("[+] Menjalankan localhost...")
+    run_localhost()
 
 if __name__ == "__main__":
     try:
