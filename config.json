@@ -1,0 +1,11 @@
+{
+  "threads": 10,
+  "timeout": 8,
+  "max_depth": 3,
+  "delay": 0.5,
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  "output_dir": "./reports",
+  "enable_advanced": true,
+  "enable_cve_check": true,
+  "verbose": false
+}
