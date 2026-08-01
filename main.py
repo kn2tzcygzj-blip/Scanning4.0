@@ -25,6 +25,37 @@ except ImportError as e:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 init(autoreset=True)
 
+# ==================== IMPORT CUSTOM MODULES ====================
+try:
+    from utils import is_false_positive, time_based_test, check_known_cve
+    from advanced_scanners import *
+except ImportError as e:
+    print(f"[!] Missing advanced modules: {e}. Run: pip install requests colorama")
+    print("[!] Advanced scanners will be disabled.")
+    # Fallback: define dummy functions
+    def is_false_positive(a,b): return False
+    def time_based_test(a,b,c,d,e): return False
+    def check_known_cve(a): return []
+
+# ==================== LOAD CONFIG ====================
+CONFIG = {
+    "threads": 10,
+    "timeout": 8,
+    "max_depth": 3,
+    "delay": 0.5,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "output_dir": "./reports",
+    "enable_advanced": True,
+    "enable_cve_check": True,
+    "verbose": False
+}
+
+try:
+    with open("config.json", "r") as f:
+        CONFIG.update(json.load(f))
+except:
+    pass
+
 # ==================== LOGGER ====================
 def log_info(msg, color='green'):
     colors = {'green': Fore.GREEN, 'red': Fore.RED, 'yellow': Fore.YELLOW,
@@ -36,9 +67,7 @@ def get_session(proxy=None):
     session = requests.Session()
     if proxy:
         session.proxies = {'http': proxy, 'https': proxy}
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
+    session.headers.update({'User-Agent': CONFIG.get("user_agent")})
     retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('http://', adapter)
@@ -48,10 +77,10 @@ def get_session(proxy=None):
 
 # ==================== CRAWLER ====================
 class Crawler:
-    def __init__(self, base_url, proxy=None, max_depth=2):
+    def __init__(self, base_url, proxy=None):
         self.base_url = base_url.rstrip('/')
         self.session = get_session(proxy)
-        self.max_depth = max_depth
+        self.max_depth = CONFIG.get("max_depth", 2)
         self.visited = set()
         self.urls = set()
         self.forms = []
@@ -74,7 +103,7 @@ class Crawler:
         with self.lock:
             self.visited.add(url)
         try:
-            resp = self.session.get(url, timeout=8, allow_redirects=True)
+            resp = self.session.get(url, timeout=CONFIG.get("timeout", 8), allow_redirects=True)
             if resp.status_code != 200:
                 return
             html = resp.text
@@ -138,7 +167,9 @@ class Fingerprinter:
         return tech
 
 # ==================== REPORT ====================
-def generate_report(findings, target, tech_stack, output_dir="./reports"):
+def generate_report(findings, target, tech_stack, output_dir=None):
+    if not output_dir:
+        output_dir = CONFIG.get("output_dir", "./reports")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_target = target.replace('https://', '').replace('http://', '').replace('/', '_')
@@ -227,6 +258,17 @@ def generate_report(findings, target, tech_stack, output_dir="./reports"):
 # ==================== ENGINE ====================
 from scanners import ALL_SCANNERS
 
+# Jika advanced scanners tersedia, tambahkan ke daftar
+try:
+    from advanced_scanners import *
+    ADVANCED_SCANNERS = [
+        NoSQLiScanner, SSRFScanner, JWTScanner, GraphQLScanner,
+        CVEScanner, RaceConditionScanner, FileUploadScanner, SensitiveHeaderScanner
+    ]
+    ALL_SCANNERS.extend(ADVANCED_SCANNERS)
+except:
+    pass
+
 class ScanEngine:
     def __init__(self, target_url, proxy=None):
         self.target_url = target_url.rstrip('/')
@@ -242,6 +284,19 @@ class ScanEngine:
         fp = Fingerprinter(self.target_url, self.proxy)
         self.tech_stack = fp.detect()
         log_info(f"Tech Stack: {self.tech_stack}", "yellow")
+
+        # CVE Check
+        if CONFIG.get("enable_cve_check", True):
+            cves = check_known_cve(self.tech_stack)
+            for cve in cves:
+                log_info(f"[CVE] {cve}", "red")
+                self.findings.append({
+                    'severity': 'HIGH',
+                    'title': cve,
+                    'description': 'Known vulnerability detected based on tech stack',
+                    'evidence': '',
+                    'timestamp': datetime.datetime.now().isoformat()
+                })
 
         log_info("Crawling target...", "cyan")
         crawler = Crawler(self.target_url, self.proxy)
@@ -260,7 +315,13 @@ class ScanEngine:
 
             self.current_method = idx + 1
             scanner = scanner_class(self.target_url, self.proxy)
-            scanner.set_context(urls=urls, forms=forms, params=params, js_endpoints=js_endpoints)
+            scanner.set_context(
+                urls=urls,
+                forms=forms,
+                params=params,
+                js_endpoints=js_endpoints,
+                tech_stack=self.tech_stack
+            )
 
             method_name = scanner.__class__.__name__.replace('Scanner', '')
             log_info(f"[{self.current_method}/{self.total_methods}] Scanning: {method_name}", "magenta")
