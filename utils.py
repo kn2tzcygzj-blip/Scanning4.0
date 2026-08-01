@@ -1,191 +1,71 @@
-import re
 import time
-import json
+import hashlib
 import base64
 import urllib.parse
-import hashlib
-from scanners import BaseScanner
-from utils import is_false_positive, time_based_test, encode_payload
+import re
 
 # ============================
-# NOSQL INJECTION
+# VALIDATOR FALSE POSITIVE
 # ============================
-class NoSQLiScanner(BaseScanner):
-    def scan(self):
-        findings = []
-        params = self.context.get('params', ['id', 'user', 'q', 'search'])
-        payloads = [
-            "{'$ne': ''}", "{'$gt': ''}", "{'$regex': '.*'}",
-            "{'$where': '1==1'}", "{'$or': [{'a': 'b'}, {'a': 'b'}]}"
-        ]
-        for param in params[:5]:
-            for payload in payloads:
-                test_url = f"{self.target_url}?{param}={payload}"
-                resp = self._safe_get(test_url)
-                if resp and resp.status_code == 200:
-                    if 'MongoError' in resp.text or 'MongoDB' in resp.text:
-                        findings.append(self._add_finding(
-                            'HIGH', 'NoSQL Injection', f'Parameter {param} vulnerable', resp.text[:300]
-                        ))
-                        break
-        return findings
+def is_false_positive(response_text, payload_type='sql'):
+    """
+    Cek apakah response benar-benar menunjukkan celah atau hanya false positive.
+    """
+    if payload_type == 'sql':
+        sql_keywords = ['sql', 'syntax', 'mysql', 'postgresql', 'oracle', 'sqlite', 'pg::', 'odbc']
+        if not any(k in response_text.lower() for k in sql_keywords):
+            return True
+        # Jika error muncul tapi tidak ada query yang dieksekusi, bisa FP
+        if 'stack trace' in response_text.lower() and not 'sql' in response_text.lower():
+            return True
+    elif payload_type == 'xss':
+        if not re.search(r'<script|<img.*onerror|javascript:|<svg/onload', response_text, re.I):
+            return True
+    elif payload_type == 'lfi':
+        if not re.search(r'root:|nobody:|/etc/passwd|windows|boot.ini', response_text, re.I):
+            return True
+    return False
 
 # ============================
-# SSRF ADVANCED
+# TIME-BASED DETECTOR
 # ============================
-class SSRFScanner(BaseScanner):
-    def scan(self):
-        findings = []
-        params = self.context.get('params', ['url', 'src', 'dest', 'redirect', 'path'])
-        payloads = [
-            'http://169.254.169.254/latest/meta-data/',
-            'http://metadata.google.internal/',
-            'http://127.0.0.1:8080',
-            'http://localhost:8080',
-            'http://[::1]:8080',
-            'http://169.254.169.254/latest/user-data/',
-        ]
-        for param in params[:5]:
-            for payload in payloads:
-                test_url = f"{self.target_url}?{param}={payload}"
-                resp = self._safe_get(test_url)
-                if resp and resp.status_code == 200:
-                    if '169.254' in resp.text or 'metadata' in resp.text or 'localhost' in resp.text:
-                        findings.append(self._add_finding(
-                            'HIGH', 'SSRF', f'Parameter {param} vulnerable', resp.text[:300]
-                        ))
-                        break
-        return findings
+def time_based_test(url, param, payload, session, delay=5):
+    """
+    Tes SQL Injection time-based dengan mengukur waktu response.
+    """
+    try:
+        start = time.time()
+        session.get(f"{url}?{param}={payload}", timeout=10)
+        elapsed = time.time() - start
+        return elapsed >= delay
+    except:
+        return False
 
 # ============================
-# JWT WEAKNESS
+# PAYLOAD ENCODER
 # ============================
-class JWTScanner(BaseScanner):
-    def scan(self):
-        findings = []
-        # Simulasi: cek cookie / header Authorization
-        try:
-            resp = self._safe_get(self.target_url)
-            if not resp:
-                return findings
-            auth = resp.headers.get('Authorization', '')
-            if 'Bearer' in auth:
-                token = auth.replace('Bearer ', '')
-                if token.count('.') == 2:
-                    # Cek algoritma 'none'
-                    import base64, json
-                    header = json.loads(base64.b64decode(token.split('.')[0] + '=='))
-                    if header.get('alg') == 'none':
-                        findings.append(self._add_finding(
-                            'HIGH', 'JWT None Algorithm', 'JWT uses "none" algorithm', token
-                        ))
-        except:
-            pass
-        return findings
+def encode_payload(payload, encoding='url'):
+    if encoding == 'url':
+        return urllib.parse.quote(payload)
+    elif encoding == 'base64':
+        return base64.b64encode(payload.encode()).decode()
+    elif encoding == 'double_url':
+        return urllib.parse.quote(urllib.parse.quote(payload))
+    return payload
 
 # ============================
-# GRAPHQL INTROSPECTION
+# CVE SIMULATOR (NVD MOCK)
 # ============================
-class GraphQLScanner(BaseScanner):
-    def scan(self):
-        findings = []
-        paths = ['/graphql', '/v1/graphql', '/api/graphql', '/graphiql']
-        for path in paths:
-            resp = self._safe_get(f"{self.target_url}{path}")
-            if resp and resp.status_code == 200:
-                if 'GraphQL' in resp.text or 'schema' in resp.text:
-                    findings.append(self._add_finding(
-                        'MEDIUM', 'GraphQL Endpoint Found', f'{path} accessible', resp.text[:300]
-                    ))
-                    # Cek introspection
-                    query = '{"query":"query { __schema { types { name } } }"}'
-                    post_resp = self._safe_post(f"{self.target_url}{path}", data=query)
-                    if post_resp and '__schema' in post_resp.text:
-                        findings.append(self._add_finding(
-                            'HIGH', 'GraphQL Introspection Enabled', 'Schema exposed', post_resp.text[:300]
-                        ))
-                    break
-        return findings
-
-    def _safe_post(self, url, data, timeout=8):
-        try:
-            return self.session.post(url, data=data, timeout=timeout)
-        except:
-            return None
-
-# ============================
-# CVE CHECKER
-# ============================
-class CVEScanner(BaseScanner):
-    def scan(self):
-        findings = []
-        # Ambil tech_stack dari context (diisi oleh engine)
-        tech = self.context.get('tech_stack', {})
-        if 'WordPress' in tech.get('cms', ''):
-            findings.append(self._add_finding(
-                'HIGH', 'CVE-2023-5360', 'WordPress SQL Injection vulnerability', 'CVE-2023-5360'
-            ))
-        if 'Apache' in tech.get('server', ''):
-            findings.append(self._add_finding(
-                'MEDIUM', 'CVE-2021-42013', 'Apache Path Traversal', 'CVE-2021-42013'
-            ))
-        return findings
-
-# ============================
-# RACE CONDITION (SIMULATED)
-# ============================
-class RaceConditionScanner(BaseScanner):
-    def scan(self):
-        findings = []
-        import threading
-        urls = self.context.get('urls', [self.target_url])
-        for url in urls[:3]:
-            # Coba 5 request paralel ke URL yang sama
-            def req():
-                try:
-                    self.session.get(url, timeout=5)
-                except:
-                    pass
-            threads = [threading.Thread(target=req) for _ in range(10)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-            # Cek apakah ada respon tidak wajar (misal 500 atau 429)
-            resp = self._safe_get(url)
-            if resp and resp.status_code == 500:
-                findings.append(self._add_finding(
-                    'MEDIUM', 'Race Condition Possible', f'{url} returned 500 on parallel requests'
-                ))
-                break
-        return findings
-
-# ============================
-# FILE UPLOAD DETECTION
-# ============================
-class FileUploadScanner(BaseScanner):
-    def scan(self):
-        findings = []
-        resp = self._safe_get(self.target_url)
-        if resp and re.search(r'<input[^>]*type=["\']file["\']', resp.text, re.I):
-            findings.append(self._add_finding(
-                'MEDIUM', 'File Upload Form Found', 'Possible unrestricted file upload', resp.text[:300]
-            ))
-        return findings
-
-# ============================
-# SENSITIVE HEADER EXPOSURE
-# ============================
-class SensitiveHeaderScanner(BaseScanner):
-    def scan(self):
-        findings = []
-        resp = self._safe_get(self.target_url)
-        if not resp:
-            return findings
-        sensitive = ['Server', 'X-Powered-By', 'X-AspNet-Version', 'X-AspNetMvc-Version']
-        for h in sensitive:
-            if h in resp.headers:
-                findings.append(self._add_finding(
-                    'LOW', f'Sensitive Header: {h}', f'{h} exposes technology info', resp.headers[h]
-                ))
-        return findings
+def check_known_cve(tech_stack):
+    """
+    Cek CVE berdasarkan tech stack yang terdeteksi.
+    """
+    cve_list = []
+    if 'WordPress' in tech_stack.get('cms', ''):
+        cve_list.append('CVE-2023-5360 (WordPress SQL Injection)')
+        cve_list.append('CVE-2023-3460 (WordPress XSS)')
+    if 'Apache' in tech_stack.get('server', ''):
+        cve_list.append('CVE-2021-42013 (Apache Path Traversal)')
+    if 'nginx' in tech_stack.get('server', ''):
+        cve_list.append('CVE-2017-7529 (Nginx Integer Overflow)')
+    return cve_list
